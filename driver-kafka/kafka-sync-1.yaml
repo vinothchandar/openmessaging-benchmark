@@ -24,6 +24,7 @@ driverClass: io.openmessaging.benchmark.driver.kafka.KafkaBenchmarkDriver
 
 # Kafka client-specific configuration
 replicationFactor: 3
+reset: true
 
 topicConfig: |
   min.insync.replicas=2
@@ -34,7 +35,7 @@ commonConfig: |
   bootstrap.servers=localhost:9092
 
 producerConfig: |
-  acks=all
+  acks=1
   linger.ms=1
   batch.size=131072
 

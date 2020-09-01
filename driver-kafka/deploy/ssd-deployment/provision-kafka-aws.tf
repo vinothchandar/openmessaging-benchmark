@@ -1,6 +1,7 @@
 provider "aws" {
   region  = "${var.region}"
   version = "~> 2.7"
+  profile = var.profile
 }
 
 provider "random" {
@@ -31,6 +32,7 @@ variable "region" {}
 variable "ami" {}
 
 variable "az" {}
+variable "profile" {}
 
 variable "instance_types" {
   type = "map"
@@ -69,17 +71,22 @@ resource "aws_subnet" "benchmark_subnet" {
   availability_zone       = "${var.az}"
 }
 
+# Get public IP of this machine
+data "http" "myip" {
+  url = "http://ipv4.icanhazip.com"
+}
+
 resource "aws_security_group" "benchmark_security_group" {
   name   = "terraform-kafka-${random_id.hash.hex}"
   vpc_id = "${aws_vpc.benchmark_vpc.id}"
 
   # SSH access from anywhere
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # ingress {
+  #   from_port   = 22
+  #   to_port     = 22
+  #   protocol    = "tcp"
+  #   cidr_blocks = ["0.0.0.0/0"]
+  # }
 
   # All ports open within the VPC
   ingress {
@@ -88,6 +95,28 @@ resource "aws_security_group" "benchmark_security_group" {
     protocol    = "tcp"
     cidr_blocks = ["10.0.0.0/16"]
   }
+
+  # All ports open to this machine
+  ingress {
+    from_port   = 0
+    to_port     = 65535
+    protocol    = "tcp"
+    cidr_blocks = ["${chomp(data.http.myip.body)}/32"]
+  }
+
+  # Prometheus/Dashboard access
+  # ingress {
+  #   from_port   = 9090
+  #   to_port     = 9090
+  #   protocol    = "tcp"
+  #   cidr_blocks = ["0.0.0.0/0"]
+  # }
+  # ingress {
+  #   from_port   = 3000
+  #   to_port     = 3000
+  #   protocol    = "tcp"
+  #   cidr_blocks = ["0.0.0.0/0"]
+  # }
 
   # outbound internet access
   egress {
@@ -114,6 +143,7 @@ resource "aws_instance" "zookeeper" {
   subnet_id              = "${aws_subnet.benchmark_subnet.id}"
   vpc_security_group_ids = ["${aws_security_group.benchmark_security_group.id}"]
   count                  = "${var.num_instances["zookeeper"]}"
+  monitoring             = true
 
   tags = {
     Name = "zk-${count.index}"
@@ -127,6 +157,7 @@ resource "aws_instance" "kafka" {
   subnet_id              = "${aws_subnet.benchmark_subnet.id}"
   vpc_security_group_ids = ["${aws_security_group.benchmark_security_group.id}"]
   count                  = "${var.num_instances["kafka"]}"
+  monitoring             = true
 
   tags = {
     Name = "kafka-${count.index}"
@@ -140,12 +171,47 @@ resource "aws_instance" "client" {
   subnet_id              = "${aws_subnet.benchmark_subnet.id}"
   vpc_security_group_ids = ["${aws_security_group.benchmark_security_group.id}"]
   count                  = "${var.num_instances["client"]}"
+  monitoring             = true
 
   tags = {
     Name = "kafka-client-${count.index}"
   }
 }
 
-output "client_ssh_host" {
-  value = "${aws_instance.client.0.public_ip}"
+resource "aws_instance" "prometheus" {
+  ami                    = "${var.ami}"
+  instance_type          = "${var.instance_types["prometheus"]}"
+  key_name               = "${aws_key_pair.auth.id}"
+  subnet_id              = "${aws_subnet.benchmark_subnet.id}"
+  vpc_security_group_ids = ["${aws_security_group.benchmark_security_group.id}"]
+  count                  = "${var.num_instances["prometheus"]}"
+
+  tags = {
+    Name = "prometheus-${count.index}"
+  }
+}
+
+output "clients" {
+  value = {
+    for instance in aws_instance.client :
+    instance.public_ip => instance.private_ip
+  }
+}
+
+output "brokers" {
+  value = {
+    for instance in aws_instance.kafka :
+    instance.public_ip => instance.private_ip
+  }
+}
+
+output "zookeeper" {
+  value = {
+    for instance in aws_instance.zookeeper :
+    instance.public_ip => instance.private_ip
+  }
+}
+
+output "prometheus_host" {
+  value = "${aws_instance.prometheus.0.public_ip}"
 }

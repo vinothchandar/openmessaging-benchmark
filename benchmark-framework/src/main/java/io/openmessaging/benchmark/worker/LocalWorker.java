@@ -23,12 +23,24 @@ import static java.util.stream.Collectors.toList;
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.function.Function;
+
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectWriter;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import com.google.common.base.Preconditions;
+import com.google.common.util.concurrent.RateLimiter;
 
 import org.HdrHistogram.Recorder;
 import org.apache.bookkeeper.stats.Counter;
@@ -37,13 +49,6 @@ import org.apache.bookkeeper.stats.OpStatsLogger;
 import org.apache.bookkeeper.stats.StatsLogger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.fasterxml.jackson.databind.DeserializationFeature;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.ObjectWriter;
-import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
-import com.google.common.base.Preconditions;
-import com.google.common.util.concurrent.RateLimiter;
 
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.openmessaging.benchmark.DriverConfiguration;
@@ -101,6 +106,8 @@ public class LocalWorker implements Worker, ConsumerCallback {
 
     private boolean consumersArePaused = false;
 
+    private boolean producersArePaused = false;
+
     public LocalWorker() {
         this(NullStatsLogger.INSTANCE);
     }
@@ -137,24 +144,36 @@ public class LocalWorker implements Worker, ConsumerCallback {
     }
 
     @Override
-    public List<String> createTopics(TopicsInfo topicsInfo) {
+    public List<Topic> createTopics(TopicsInfo topicsInfo) {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
         Timer timer = new Timer();
 
         String topicPrefix = benchmarkDriver.getTopicNamePrefix();
 
-        List<String> topics = new ArrayList<>();
+        List<Topic> topics = new ArrayList<>();
         for (int i = 0; i < topicsInfo.numberOfTopics; i++) {
-            String topic = String.format("%s-%s-%04d", topicPrefix, RandomGenerator.getRandomString(), i);
+            Topic topic = new Topic(String.format("%s-%s-%04d", topicPrefix, RandomGenerator.getRandomString(), i),
+                    topicsInfo.numberOfPartitionsPerTopic);
             topics.add(topic);
-            futures.add(benchmarkDriver.createTopic(topic, topicsInfo.numberOfPartitionsPerTopic));
+            futures.add(benchmarkDriver.createTopic(topic.name, topic.partitions));
         }
 
         futures.forEach(CompletableFuture::join);
 
         log.info("Created {} topics in {} ms", topics.size(), timer.elapsedMillis());
         return topics;
+    }
+
+    @Override
+    public void notifyTopicCreation(List<Topic> topics) {
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        for (Topic topic : topics) {
+            futures.add(benchmarkDriver.notifyTopicCreation(topic.name, topic.partitions));
+        }
+
+        futures.forEach(CompletableFuture::join);
     }
 
     @Override
@@ -173,7 +192,8 @@ public class LocalWorker implements Worker, ConsumerCallback {
         Timer timer = new Timer();
 
         List<CompletableFuture<BenchmarkConsumer>> futures = consumerAssignment.topicsSubscriptions.stream()
-                .map(ts -> benchmarkDriver.createConsumer(ts.topic, ts.subscription, this)).collect(toList());
+                .map(ts -> benchmarkDriver.createConsumer(ts.topic, ts.subscription, Optional.of(ts.partition), this))
+                .collect(toList());
 
         futures.forEach(f -> consumers.add(f.join()));
         log.info("Created {} consumers in {} ms", consumers.size(), timer.elapsedMillis());
@@ -212,22 +232,29 @@ public class LocalWorker implements Worker, ConsumerCallback {
 
             try {
                 while (!testCompleted) {
+                    while (producersArePaused) {
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                    }
+
                     producers.forEach(producer -> {
                         rateLimiter.acquire();
                         byte[] payloadData = payloadCount == 0 ? firstPayload : payloads.get(r.nextInt(payloadCount));
                         final long sendTime = System.nanoTime();
-                        producer.sendAsync(Optional.ofNullable(keyDistributor.next()), payloadData)
-                                .thenRun(() -> {
+                        producer.sendAsync(Optional.ofNullable(keyDistributor.next()), payloadData).thenRun(() -> {
                             messagesSent.increment();
                             totalMessagesSent.increment();
                             messagesSentCounter.inc();
                             bytesSent.add(payloadData.length);
                             bytesSentCounter.add(payloadData.length);
 
-                            long latencyMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - sendTime);
-                            publishLatencyRecorder.recordValue(latencyMicros);
-                            cumulativePublishLatencyRecorder.recordValue(latencyMicros);
-                            publishLatencyStats.registerSuccessfulEvent(latencyMicros, TimeUnit.MICROSECONDS);
+                            long microTime = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - sendTime);
+                            publishLatencyRecorder.recordValue(microTime);
+                            cumulativePublishLatencyRecorder.recordValue(microTime);
+                            publishLatencyStats.registerSuccessfulEvent(microTime, TimeUnit.MICROSECONDS);
                         }).exceptionally(ex -> {
                             log.warn("Write error on message", ex);
                             return null;
@@ -242,7 +269,7 @@ public class LocalWorker implements Worker, ConsumerCallback {
 
     @Override
     public void adjustPublishRate(double publishRate) {
-        if(publishRate < 1.0) {
+        if (publishRate < 1.0) {
             rateLimiter.setRate(1.0);
             return;
         }
@@ -291,8 +318,11 @@ public class LocalWorker implements Worker, ConsumerCallback {
         bytesReceived.add(data.length);
         bytesReceivedCounter.add(data.length);
 
-        long now = System.currentTimeMillis();
-        long endToEndLatencyMicros = TimeUnit.MILLISECONDS.toMicros(now - publishTimestamp);
+        // NOTE: PublishTimestamp is expected to be using the wall-clock time across
+        // machines
+        Instant currentTime = Instant.now();
+        long currentTimeNanos = TimeUnit.SECONDS.toNanos(currentTime.getEpochSecond()) + currentTime.getNano();
+        long endToEndLatencyMicros = TimeUnit.NANOSECONDS.toMicros(currentTimeNanos - publishTimestamp);
         if (endToEndLatencyMicros > 0) {
             endToEndCumulativeLatencyRecorder.recordValue(endToEndLatencyMicros);
             endToEndLatencyRecorder.recordValue(endToEndLatencyMicros);
@@ -332,6 +362,7 @@ public class LocalWorker implements Worker, ConsumerCallback {
     public void stopAll() throws IOException {
         testCompleted = true;
         consumersArePaused = false;
+        producersArePaused = false;
 
         publishLatencyRecorder.reset();
         cumulativePublishLatencyRecorder.reset();
@@ -382,4 +413,16 @@ public class LocalWorker implements Worker, ConsumerCallback {
     }
 
     private static final Logger log = LoggerFactory.getLogger(LocalWorker.class);
+
+    @Override
+    public void pauseProducers() throws IOException {
+        producersArePaused = true;
+        log.info("Pausing producers");
+    }
+
+    @Override
+    public void resumeProducers() throws IOException {
+        producersArePaused = false;
+        log.info("Resuming producers");
+    }
 }
